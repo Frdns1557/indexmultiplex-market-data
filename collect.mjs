@@ -79,6 +79,47 @@ async function extendedQuote(t,summary){
  const target=path.join(STAGE,'funds',t+'.json'),detail=await readJson(target);
  await save(target,{...detail,...summary,prices:detail.prices,dividends:detail.dividends,holdings:detail.holdings});
 }
+export const DIVERGENCE_RULES={indicator:'Wilder RSI 14',price:'split-adjusted close',left:2,right:2,minGap:5,maxGap:60,recentDaily:10,recentWeekly:4,weeklyMaxGap:26,closedBarsOnly:true};
+export function rsiSeries(values,period=14){
+ const out=Array(values.length).fill(null);if(values.length<=period)return out;
+ let gain=0,loss=0;for(let i=1;i<=period;i++){const d=values[i]-values[i-1];gain+=Math.max(d,0);loss+=Math.max(-d,0)}gain/=period;loss/=period;
+ const value=()=>gain===0&&loss===0?50:loss===0?100:100-100/(1+gain/loss);
+ out[period]=value();for(let i=period+1;i<values.length;i++){const d=values[i]-values[i-1];gain=(gain*(period-1)+Math.max(d,0))/period;loss=(loss*(period-1)+Math.max(-d,0))/period;out[i]=value()}return out;
+}
+function divWeekKey(date){const d=new Date(date+'T12:00:00Z');d.setUTCDate(d.getUTCDate()-(d.getUTCDay()+6)%7);return d.toISOString().slice(0,10)}
+function divNextTradingDay(date){const d=new Date(date+'T17:00:00Z');for(let n=0;n<10;n++){d.setUTCDate(d.getUTCDate()+1);if(sessionAt(d).tradingDay)return d.toISOString().slice(0,10)}throw Error('No next trading day')}
+export function closedDivergenceBars(prices,frame,now=new Date()){
+ const session=sessionAt(now);const closedToday=!session.tradingDay||session.time>=session.close;
+ const daily=(prices||[]).filter(p=>Array.isArray(p)&&/^\d{4}-\d{2}-\d{2}$/.test(p[0])&&Number.isFinite(p[1])&&p[1]>0&&(p[0]<session.date||(p[0]===session.date&&closedToday)));
+ if(frame==='daily')return daily;
+ const groups=new Map();for(const p of daily)groups.set(divWeekKey(p[0]),p);
+ return [...groups].filter(([key,p])=>divWeekKey(divNextTradingDay(p[0]))!==key).map(([,p])=>p);
+}
+export function findDivergences(bars,rsis,frame='daily'){
+ const {left,right}=DIVERGENCE_RULES,maxAge=frame==='weekly'?4:10,maxGap=frame==='weekly'?26:60,minGap=5;
+ const signals=[];
+ for(const type of ['bullish','bearish']){
+  const pivots=[];for(let i=Math.max(14,left);i<bars.length-right;i++){
+   const v=bars[i][1];let pivot=true;for(let k=1;k<=left;k++)if(type==='bullish'?v>=bars[i-k][1]:v<=bars[i-k][1])pivot=false;for(let k=1;k<=right;k++)if(type==='bullish'?v>=bars[i+k][1]:v<=bars[i+k][1])pivot=false;if(pivot&&Number.isFinite(rsis[i]))pivots.push(i);
+  }
+  for(let k=1;k<pivots.length;k++){
+   const a=pivots[k-1],b=pivots[k],confirmed=b+right,age=bars.length-1-confirmed;
+   if(b-a<minGap||b-a>maxGap||age>=maxAge)continue;
+   const p1=bars[a][1],p2=bars[b][1],r1=rsis[a],r2=rsis[b];
+   if(!(type==='bullish'?p2<p1&&r2>r1:p2>p1&&r2<r1))continue;
+   // A later close beyond the second pivot invalidates the setup.
+   if(bars.slice(confirmed+1).some(p=>type==='bullish'?p[1]<p2:p[1]>p2))continue;
+   signals.push({type,timeframe:frame,firstDate:bars[a][0],secondDate:bars[b][0],confirmedDate:bars[confirmed][0],firstPrice:p1,secondPrice:p2,firstRsi:r1,secondRsi:r2,priceChange:(p2/p1-1)*100,rsiChange:r2-r1,barsApart:b-a,barsSinceConfirmation:age});
+  }
+ }
+ return signals;
+}
+export function scanFundDivergences(f,now=new Date()){
+ const output={daily:[],weekly:[],insufficient:[]};
+ for(const frame of ['daily','weekly']){const bars=closedDivergenceBars(f.prices,frame,now);if(bars.length<24){output.insufficient.push(frame);continue}const rsis=rsiSeries(bars.map(p=>p[1]));const found=findDivergences(bars,rsis,frame);for(const type of ['bullish','bearish']){const hit=found.filter(s=>s.type===type).at(-1);if(hit)output[frame].push({ticker:f.ticker,name:f.name,...hit,lastClose:bars.at(-1)[1],lastCloseDate:bars.at(-1)[0]})}}
+ return output;
+}
+
 async function main(){
  const slot=collectionSlot(),manual=process.env.MANUAL_REFRESH==='true';
  const prior=await readJson(path.join(ROOT,'catalog.json'));
@@ -102,6 +143,10 @@ async function main(){
  const indices=await collectIndices();const asOf=new Date().toISOString();
  results.sort((a,b)=>b.aum-a.aum);
  const catalog={...prior,asOf,threshold:THRESHOLD,count:results.length,funds:results,universePolicy:UNIVERSE_POLICY,leverageThreshold:50_000_000,live:true,completedSlot:slot.due?key:prior.completedSlot,failedTickers:Object.keys(failures),errors:[],universeDate:slot.tradingDate,refreshCadence:'regular:30m; pre:1h; after:2; overnight:2',publicFeed:true,snapshotRef:process.env.SNAPSHOT_REF||null};
+ const divergence={asOf,universeAsOf:asOf,snapshotRef:catalog.snapshotRef,rules:DIVERGENCE_RULES,coverage:{total:results.length,daily:0,weekly:0},daily:{bullish:[],bearish:[]},weekly:{bullish:[],bearish:[]}};
+ for(const f of results){const detail=await readJson(path.join(STAGE,'funds',f.ticker+'.json'));const scan=scanFundDivergences(detail);for(const frame of ['daily','weekly']){if(!scan.insufficient.includes(frame))divergence.coverage[frame]++;for(const signal of scan[frame])divergence[frame][signal.type].push(signal)}}
+ for(const frame of ['daily','weekly'])for(const type of ['bullish','bearish'])divergence[frame][type].sort((a,b)=>b.confirmedDate.localeCompare(a.confirmedDate)||Math.abs(b.rsiChange)-Math.abs(a.rsiChange));
+ await save(path.join(STAGE,'divergence.json'),divergence);
  await save(path.join(STAGE,'catalog.json'),catalog);await save(path.join(STAGE,'indices.json'),indices);
  await save(path.join(STAGE,'status.json'),{state:'completed',lastSuccessfulAt:asOf,count:results.length,failed:failures,session:slot,mode:'code-only-public-feed'});
  await rm(ROOT,{recursive:true,force:true});await rename(STAGE,ROOT);
