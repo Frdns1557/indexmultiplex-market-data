@@ -79,7 +79,7 @@ async function extendedQuote(t,summary){
  const target=path.join(STAGE,'funds',t+'.json'),detail=await readJson(target);
  await save(target,{...detail,...summary,prices:detail.prices,dividends:detail.dividends,holdings:detail.holdings});
 }
-export const DIVERGENCE_RULES={indicator:'Wilder RSI 14',price:'split-adjusted close',left:2,right:2,minGap:5,maxGap:60,recentDaily:10,recentWeekly:4,weeklyMaxGap:26,closedBarsOnly:true};
+export const DIVERGENCE_RULES={indicator:'Wilder RSI 14',price:'split-adjusted close',left:2,right:2,minGap:5,maxGap:60,recentDaily:10,recentWeekly:4,weeklyMaxGap:26,closedBarsOnly:true,exposure:'positive-1x-only'};
 export function rsiSeries(values,period=14){
  const out=Array(values.length).fill(null);if(values.length<=period)return out;
  let gain=0,loss=0;for(let i=1;i<=period;i++){const d=values[i]-values[i-1];gain+=Math.max(d,0);loss+=Math.max(-d,0)}gain/=period;loss/=period;
@@ -114,8 +114,9 @@ export function findDivergences(bars,rsis,frame='daily'){
  }
  return signals;
 }
+export function divergenceEligible(f){return f?.leverage===1&&!(f.tags||[]).includes('인버스')&&!/\binverse\b|\bbear\b|\bshort\b(?![ -]?(?:term|duration|maturity))/i.test(f.name||'')}
 export function scanFundDivergences(f,now=new Date()){
- const output={daily:[],weekly:[],insufficient:[]};
+ const output={daily:[],weekly:[],insufficient:[]};if(!divergenceEligible(f))return {...output,excluded:true};
  for(const frame of ['daily','weekly']){const bars=closedDivergenceBars(f.prices,frame,now);if(bars.length<24){output.insufficient.push(frame);continue}const rsis=rsiSeries(bars.map(p=>p[1]));const found=findDivergences(bars,rsis,frame);for(const type of ['bullish','bearish']){const hit=found.filter(s=>s.type===type).at(-1);if(hit)output[frame].push({ticker:f.ticker,name:f.name,...hit,lastClose:bars.at(-1)[1],lastCloseDate:bars.at(-1)[0]})}}
  return output;
 }
@@ -143,8 +144,8 @@ async function main(){
  const indices=await collectIndices();const asOf=new Date().toISOString();
  results.sort((a,b)=>b.aum-a.aum);
  const catalog={...prior,asOf,threshold:THRESHOLD,count:results.length,funds:results,universePolicy:UNIVERSE_POLICY,leverageThreshold:50_000_000,live:true,completedSlot:slot.due?key:prior.completedSlot,failedTickers:Object.keys(failures),errors:[],universeDate:slot.tradingDate,refreshCadence:'regular:30m; pre:1h; after:2; overnight:2',publicFeed:true,snapshotRef:process.env.SNAPSHOT_REF||null};
- const divergence={asOf,universeAsOf:asOf,snapshotRef:catalog.snapshotRef,rules:DIVERGENCE_RULES,coverage:{total:results.length,daily:0,weekly:0},daily:{bullish:[],bearish:[]},weekly:{bullish:[],bearish:[]}};
- for(const f of results){const detail=await readJson(path.join(STAGE,'funds',f.ticker+'.json'));const scan=scanFundDivergences(detail);for(const frame of ['daily','weekly']){if(!scan.insufficient.includes(frame))divergence.coverage[frame]++;for(const signal of scan[frame])divergence[frame][signal.type].push(signal)}}
+ const divergence={asOf,universeAsOf:asOf,snapshotRef:catalog.snapshotRef,rules:DIVERGENCE_RULES,coverage:{total:results.filter(divergenceEligible).length,catalogTotal:results.length,daily:0,weekly:0},daily:{bullish:[],bearish:[]},weekly:{bullish:[],bearish:[]}};
+ for(const f of results.filter(divergenceEligible)){const detail=await readJson(path.join(STAGE,'funds',f.ticker+'.json'));const scan=scanFundDivergences(detail);for(const frame of ['daily','weekly']){if(!scan.insufficient.includes(frame))divergence.coverage[frame]++;for(const signal of scan[frame])divergence[frame][signal.type].push(signal)}}
  for(const frame of ['daily','weekly'])for(const type of ['bullish','bearish'])divergence[frame][type].sort((a,b)=>b.confirmedDate.localeCompare(a.confirmedDate)||Math.abs(b.rsiChange)-Math.abs(a.rsiChange));
  await save(path.join(STAGE,'divergence.json'),divergence);
  await save(path.join(STAGE,'catalog.json'),catalog);await save(path.join(STAGE,'indices.json'),indices);
