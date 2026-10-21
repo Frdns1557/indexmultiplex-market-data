@@ -1,0 +1,38 @@
+name: Public market data (no AI)
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: public-market-data
+  cancel-in-progress: false
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Restore public seed only on first run
+        run: |
+          if [ ! -f data/catalog.json ]; then tar -xzf seed-market-data.tar.gz; fi
+      - name: Collect due market session (no model calls)
+        env:
+          MANUAL_REFRESH: ${{ github.event_name == 'workflow_dispatch' }}
+          SNAPSHOT_REF: snapshot-${{ github.run_id }}-${{ github.run_attempt }}
+        run: node collect.mjs
+      - name: Publish verified snapshot atomically
+        env:
+          SNAPSHOT_REF: snapshot-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          git add data
+          if git diff --cached --quiet; then exit 0; fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m "Update public market snapshot"
+          git tag "$SNAPSHOT_REF"
+          git push --atomic origin HEAD:main "$SNAPSHOT_REF"
