@@ -1,0 +1,43 @@
+name: ISA market data (no AI)
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: public-market-data
+  cancel-in-progress: false
+jobs:
+  collect-isa:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install KRX trading calendar
+        run: python -m pip install 'exchange-calendars==4.12'
+      - name: Restore initial public ISA snapshot
+        run: |
+          if [ ! -f isa/catalog.json ]; then tar -xzf isa-seed.tar.gz; fi
+      - name: Collect due KRX session (no model calls)
+        env:
+          MANUAL_REFRESH: ${{ github.event_name == 'workflow_dispatch' }}
+          SNAPSHOT_REF: isa-snapshot-${{ github.run_id }}-${{ github.run_attempt }}
+        run: node collect-isa.mjs
+      - name: Publish verified ISA snapshot atomically
+        env:
+          SNAPSHOT_REF: isa-snapshot-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          git add isa
+          if git diff --cached --quiet; then exit 0; fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m "Update public ISA market snapshot"
+          git tag "$SNAPSHOT_REF"
+          git push --atomic origin HEAD:main "$SNAPSHOT_REF"
