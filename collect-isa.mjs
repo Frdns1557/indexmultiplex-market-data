@@ -1,3 +1,4 @@
+import {collectFx} from './fx.mjs';
 import {readFile,writeFile,mkdir,rename,rm,cp} from 'node:fs/promises';
 import {execFileSync} from 'node:child_process';
 import path from 'node:path';
@@ -76,5 +77,6 @@ for(const f of results.filter(f=>f.leverage===1)){
  for(const [frame,bars]of [['daily',daily],['weekly',weekly]]){if(bars.length<24)continue;divergence.coverage[frame]++;const signals=findDivergences(bars,rsiSeries(bars.map(p=>p[1])),frame);for(const type of ['bullish','bearish']){const s=signals.filter(x=>x.type===type).at(-1);if(s)divergence[frame][type].push({ticker:f.ticker,name:f.name,...s,lastClose:bars.at(-1)[1],lastCloseDate:bars.at(-1)[0]})}}
 }
 for(const frame of ['daily','weekly'])for(const type of ['bullish','bearish'])divergence[frame][type].sort((a,b)=>b.confirmedDate.localeCompare(a.confirmedDate));
+let fx;try{fx=await collectFx(source)}catch(error){fx=await read(path.join(root,'fx.json'));if(!fx?.quotes?.length)throw error;console.warn('FX collection failed; keeping previous quote timestamps.')}fx.snapshotRef=snapshotRef;await writeFile(path.join(stage,'fx.json'),JSON.stringify(fx));
 await writeFile(path.join(stage,'divergence.json'),JSON.stringify(divergence));await writeFile(path.join(stage,'catalog.json'),JSON.stringify(catalog));
 await rm(root,{recursive:true,force:true});await rename(stage,root);console.log(JSON.stringify({count:results.length,asOf:catalog.asOf,quoteDate,failed,coverage:divergence.coverage}));
